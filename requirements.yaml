@@ -1,0 +1,12 @@
+name: streamlit-snowflake-sql-generator
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.8
+  - streamlit>=1.28.0
+  - pandas>=2.0.0
+  - pip
+  - pip:
+    - snowflake-snowpark-python>=1.8.0
+    - typing-extensions>=4.0.0 

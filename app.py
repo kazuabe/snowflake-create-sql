@@ -3,11 +3,62 @@ import streamlit as st
 from snowflake.snowpark.context import get_active_session
 import pandas as pd
 import uuid
+import re
+import logging
+from typing import Optional, List, Dict, Any
+
+# ログ設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Streamlitアプリの基本設定 ---
 st.set_page_config(layout="wide")
 st.title('初心者向けSQLジェネレーター')
 
+# --- セキュリティ設定 ---
+def sanitize_identifier(identifier: Optional[str]) -> Optional[str]:
+    """識別子をサニタイズする"""
+    if not identifier or not isinstance(identifier, str):
+        return None
+    # 許可される文字のみを残す
+    sanitized = re.sub(r'[^a-zA-Z0-9_"]', '', identifier)
+    return sanitized if sanitized else None
+
+def validate_sql_value(value: Optional[str]) -> bool:
+    """SQL値の検証"""
+    if not value or not isinstance(value, str):
+        return True
+    # 危険な文字列パターンをチェック
+    dangerous_patterns = [
+        r'--',  # SQLコメント
+        r'/\*.*\*/',  # SQLコメント
+        r';\s*$',  # セミコロン
+        r'DROP\s+',  # DROP文
+        r'DELETE\s+',  # DELETE文
+        r'UPDATE\s+',  # UPDATE文
+        r'INSERT\s+',  # INSERT文
+        r'CREATE\s+',  # CREATE文
+        r'ALTER\s+',  # ALTER文
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, value, re.IGNORECASE):
+            return False
+    return True
+
+# --- エラーハンドリング関数 ---
+def handle_database_error(operation: str, error: Exception) -> None:
+    """データベースエラーの統一処理"""
+    error_msg = f"{operation}中にエラーが発生しました: {str(error)}"
+    logger.error(error_msg)
+    st.error(error_msg)
+    
+    # ユーザーフレンドリーなエラーメッセージ
+    if "connection" in str(error).lower():
+        st.info("データベース接続を確認してください。")
+    elif "permission" in str(error).lower():
+        st.info("必要な権限があるか確認してください。")
+    elif "not found" in str(error).lower():
+        st.info("指定されたオブジェクトが存在するか確認してください。")
 
 # --- セッションステートの初期化 ---
 if 'select_items' not in st.session_state:
@@ -20,8 +71,11 @@ if 'joins' not in st.session_state:
 # --- Snowflakeセッションの取得 ---
 try:
     session = get_active_session()
+    logger.info("Snowflakeセッションを正常に取得しました")
 except Exception as e:
-    st.error(f"Snowflakeセッションの取得に失敗しました: {e}")
+    error_msg = f"Snowflakeセッションの取得に失敗しました: {e}"
+    logger.error(error_msg)
+    st.error(error_msg)
     st.info("このアプリは 'Streamlit in Snowflake' 環境での実行を想定しています。")
     st.stop()
 
@@ -54,13 +108,22 @@ OPERATORS = {
     'IS NOT NULL': '空でない値'
 }
 
-
 # --- キャッシュ関数 ---
 @st.cache_data(show_spinner=False)
-def get_table_definition(db, schema, table):
+def get_table_definition(db: Optional[str], schema: Optional[str], table: Optional[str]) -> pd.DataFrame:
     """指定されたテーブルの定義（カラム名とデータ型）をDataFrameで取得してキャッシュする"""
     if not all([db, schema, table]):
         return pd.DataFrame()
+    
+    # セキュリティチェック
+    db = sanitize_identifier(db)
+    schema = sanitize_identifier(schema)
+    table = sanitize_identifier(table)
+    
+    if not all([db, schema, table]):
+        logger.warning("無効な識別子が指定されました")
+        return pd.DataFrame()
+    
     try:
         query = f"""
             SELECT COLUMN_NAME, DATA_TYPE
@@ -69,51 +132,83 @@ def get_table_definition(db, schema, table):
             AND TABLE_NAME = '{table}'
             ORDER BY ORDINAL_POSITION;
         """
-        return session.sql(query).to_pandas()
-    except Exception:
+        result = session.sql(query).to_pandas()
+        logger.info(f"テーブル定義を正常に取得しました: {db}.{schema}.{table}")
+        return result
+    except Exception as e:
+        handle_database_error("テーブル定義の取得", e)
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
-def get_qualified_table_columns(db, schema, table):
+def get_qualified_table_columns(db: Optional[str], schema: Optional[str], table: Optional[str]) -> List[str]:
     """テーブル名で修飾されたカラムリストを取得してキャッシュする"""
     if not all([db, schema, table]):
         return []
+    
+    # セキュリティチェック
+    db = sanitize_identifier(db)
+    schema = sanitize_identifier(schema)
+    table = sanitize_identifier(table)
+    
+    if not all([db, schema, table]):
+        logger.warning("無効な識別子が指定されました")
+        return []
+    
     try:
         query = f'DESC TABLE "{db}"."{schema}"."{table}"'
         cols_df = session.sql(query).collect()
-        return [f'"{table}"."{c["name"]}"' for c in cols_df]
-    except Exception:
+        result = [f'"{table}"."{c["name"]}"' for c in cols_df]
+        logger.info(f"カラム情報を正常に取得しました: {db}.{schema}.{table} ({len(result)} columns)")
+        return result
+    except Exception as e:
+        handle_database_error("カラム情報の取得", e)
         return []
 
 # --- コールバック関数 ---
-def add_item(session_state_key, parent_id=None):
+def add_item(session_state_key: str, parent_id: Optional[str] = None) -> None:
+    """セッションステートにアイテムを追加する"""
     item_id = str(uuid.uuid4())
-    new_item = {'id': item_id}
+    new_item: Dict[str, Any] = {'id': item_id}
 
     if session_state_key == 'select_items':
-        new_item.update({'column': None, 'agg_func': 'none'})
+        new_item['column'] = None
+        new_item['agg_func'] = 'none'
         st.session_state.select_items.append(new_item)
     elif session_state_key == 'where_conditions':
-        new_item.update({'logical': 'AND', 'column': None, 'operator': '=', 'value': ''})
+        new_item['logical'] = 'AND'
+        new_item['column'] = None
+        new_item['operator'] = '='
+        new_item['value'] = ''
         st.session_state.where_conditions.append(new_item)
     elif session_state_key == 'joins':
-        new_item.update({'type': 'INNER JOIN', 'right_table': None, 'on_conditions': []})
+        new_item['type'] = 'INNER JOIN'
+        new_item['right_table'] = None
+        new_item['on_conditions'] = []
         st.session_state.joins.append(new_item)
     elif session_state_key == 'on_conditions':
         for join in st.session_state.joins:
             if join['id'] == parent_id:
-                join['on_conditions'].append({'id': item_id, 'left_col': None, 'right_col': None})
+                join['on_conditions'].append({
+                    'id': item_id, 
+                    'left_col': None, 
+                    'right_col': None
+                })
                 break
 
-def remove_item(session_state_key, item_id, parent_id=None):
+def remove_item(session_state_key: str, item_id: str, parent_id: Optional[str] = None) -> None:
+    """セッションステートからアイテムを削除する"""
     if parent_id:
         for join in st.session_state.joins:
             if join['id'] == parent_id:
-                join['on_conditions'] = [c for c in join['on_conditions'] if c.get('id') != item_id]
+                join['on_conditions'] = [
+                    c for c in join['on_conditions'] 
+                    if c.get('id') != item_id
+                ]
                 break
     else:
         st.session_state[session_state_key] = [
-            item for item in st.session_state[session_state_key] if item.get('id') != item_id
+            item for item in st.session_state[session_state_key] 
+            if item.get('id') != item_id
         ]
 
 # --- UI描画関数 ---
@@ -278,17 +373,27 @@ if selected_table:
             render_condition_builder("2. WHERE句の条件を指定 (集計前の絞り込み)", 'where_conditions', qualified_columns)
 
 # --- 3. SQLの生成と実行 ---
-def build_condition_clause(session_state_key, all_columns):
+def build_condition_clause(session_state_key: str, all_columns: List[str]) -> str:
+    """条件句を構築する"""
     parts = []
     for i, cond in enumerate(st.session_state[session_state_key]):
         cond_str = ""
-        if cond.get('column') in all_columns and (cond.get('operator') not in ['IS NULL', 'IS NOT NULL'] or cond.get('value') is not None):
+        if (cond.get('column') in all_columns and 
+            (cond.get('operator') not in ['IS NULL', 'IS NOT NULL'] or cond.get('value') is not None)):
+            
             op, val, col_name = cond['operator'], cond['value'], cond['column']
+            
+            # セキュリティチェック
+            if not validate_sql_value(str(val)):
+                logger.warning(f"危険な値が検出されました: {val}")
+                continue
+                
             if op in ['IS NULL', 'IS NOT NULL']:
                 cond_str = f"{col_name} {op}"
             elif op == 'IN':
                 items = [f"'{item.strip()}'" for item in str(val).split(',') if item.strip()]
-                if items: cond_str = f"{col_name} IN ({', '.join(items)})"
+                if items: 
+                    cond_str = f"{col_name} IN ({', '.join(items)})"
             elif 'LIKE' in op:
                 like_val = str(val).replace("'", "''")
                 if op == 'LIKE_PARTIAL':
@@ -298,14 +403,24 @@ def build_condition_clause(session_state_key, all_columns):
                 elif op == 'LIKE_BACKWARD':
                     cond_str = f"{col_name} LIKE '%{like_val}'"
             else:
-                formatted_val = val if str(val).isnumeric() or (str(val).startswith("'") and str(val).endswith("'")) else f"'{val}'"
+                # 数値かどうかをチェック
+                if str(val).replace('.', '').replace('-', '').isdigit():
+                    formatted_val = val
+                else:
+                    # シングルクォートをエスケープ
+                    escaped_val = str(val).replace("'", "''")
+                    formatted_val = f"'{escaped_val}'"
                 cond_str = f"{col_name} {op} {formatted_val}"
+                
         if cond_str:
             parts.append(f"{cond['logical']} {cond_str}" if i > 0 else cond_str)
     return "\n  ".join(parts) if parts else ""
 
-if selected_table:
-    with st.expander("STEP 3: SQLを確認して実行", expanded=True):
+def generate_sql_query(selected_db: str, selected_schema: str, selected_table: str, 
+                      qualified_columns: List[str], is_aggregation_used: bool) -> str:
+    """SQLクエリを生成する"""
+    try:
+        # SELECT句の構築
         select_parts = []
         groupby_parts = []
         for item in st.session_state.select_items:
@@ -323,6 +438,7 @@ if selected_table:
         
         select_clause = ",\n    ".join(select_parts) if select_parts else "*"
         
+        # FROM句の構築
         full_from_clause = f'FROM "{selected_db}"."{selected_schema}"."{selected_table}"'
         for join in st.session_state.joins:
             if join.get('right_table') and join.get('on_conditions'):
@@ -334,24 +450,64 @@ if selected_table:
                 if on_clause_parts:
                     full_from_clause += f'\n  {join_type_str} "{selected_db}"."{selected_schema}"."{join["right_table"]}"\n    ON {" AND ".join(on_clause_parts)}'
         
+        # SQLクエリの組み立て
         generated_sql = f"SELECT\n    {select_clause}\n{full_from_clause}"
 
+        # WHERE句の追加
         where_clause = build_condition_clause('where_conditions', qualified_columns)
-        if where_clause: generated_sql += f"\nWHERE\n  {where_clause}"
+        if where_clause: 
+            generated_sql += f"\nWHERE\n  {where_clause}"
         
+        # GROUP BY句の追加
         if is_aggregation_used and groupby_parts:
             generated_sql += f"\nGROUP BY\n    {', '.join(groupby_parts)}"
         
         generated_sql += ";"
+        
+        logger.info("SQLクエリを正常に生成しました")
+        return generated_sql
+        
+    except Exception as e:
+        error_msg = f"SQLクエリの生成中にエラーが発生しました: {e}"
+        logger.error(error_msg)
+        st.error(error_msg)
+        return ""
 
-        st.write("#### 生成されたSQL"); st.code(generated_sql, language='sql')
-        if st.button('🚀 サンプルクエリを実行 (10行)', type="primary"):
-            st.write("#### 実行結果 (最初の10行)")
-            with st.spinner('クエリを実行中です...'):
-                try:
-                    execution_sql = generated_sql.rstrip(';') + " LIMIT 10;"
-                    result_df = session.sql(execution_sql).to_pandas()
-                    st.dataframe(result_df, use_container_width=True)
-                    st.success(f"最大10行のサンプルデータを取得しました。")
-                except Exception as e:
-                    st.error(f"クエリの実行中にエラーが発生しました:\n{e}")
+def execute_sample_query(sql_query: str) -> Optional[pd.DataFrame]:
+    """サンプルクエリを実行する"""
+    if not sql_query:
+        return None
+        
+    try:
+        execution_sql = sql_query.rstrip(';') + " LIMIT 10;"
+        result_df = session.sql(execution_sql).to_pandas()
+        logger.info("サンプルクエリを正常に実行しました")
+        return result_df
+    except Exception as e:
+        handle_database_error("サンプルクエリの実行", e)
+        return None
+
+if selected_table:
+    with st.expander("STEP 3: SQLを確認して実行", expanded=True):
+        # SQLクエリの生成
+        if selected_schema:  # selected_schemaがNoneでないことを確認
+            generated_sql = generate_sql_query(
+                selected_db, selected_schema, selected_table, 
+                qualified_columns, is_aggregation_used
+            )
+            
+            if generated_sql:
+                st.write("#### 生成されたSQL")
+                st.code(generated_sql, language='sql')
+                
+                if st.button('🚀 サンプルクエリを実行 (10行)', type="primary"):
+                    st.write("#### 実行結果 (最初の10行)")
+                    with st.spinner('クエリを実行中です...'):
+                        result_df = execute_sample_query(generated_sql)
+                        if result_df is not None:
+                            st.dataframe(result_df, use_container_width=True)
+                            st.success(f"最大10行のサンプルデータを取得しました。")
+            else:
+                st.error("SQLクエリの生成に失敗しました。設定を確認してください。")
+        else:
+            st.error("スキーマが選択されていません。STEP1でスキーマを選択してください。")
